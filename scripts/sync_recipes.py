@@ -43,6 +43,13 @@ SECTION_CAL = "计算"
 SECTION_OPS = "操作"
 SECTION_EXT = "附加内容"
 
+# 图片：md 里形如 ![成品](./成品.jpg)，相对 md 所在目录；转成 GitHub raw URL。
+# 注意 MCP 只把 URL 放进 image_path/images 字段，不返回图片字节 —— 客户端自己点开看。
+IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")   # group1=alt, group2=路径
+IMG_REPO = os.environ.get("IMG_REPO", "wy8102/HowToCook")
+IMG_BRANCH = os.environ.get("IMG_BRANCH", "master")
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+
 # 份量：抓「数字 [~数字] 单位」，中文单位常见于菜谱
 QTY_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:[～~\-—]\s*(\d+(?:\.\d+)?))?\s*"
@@ -134,6 +141,94 @@ def core_name(s):
     return re.sub(r"[\s\-*·]+", "", s)
 
 
+def extract_images(md_path, root):
+    """抽出 md 里引用的图片，转 GitHub raw URL，并分辨『步骤分解图』与『成品/封面图』。
+
+    返回 (cover_url, all_urls, step_images)：
+      step_images 按 md 中出现的先后排序（= 制作顺序），每项带 step 号（该图前面最近的
+      「N.」步骤，落在「操作」段内才算；段外或找不到则为 None）与 alt 文本。
+    """
+    from urllib.parse import quote
+
+    text = open(md_path, encoding="utf-8").read()
+    md_dir = os.path.relpath(os.path.dirname(md_path), root).replace(os.sep, "/")
+
+    # 「操作」段在全文中的位置区间，用来把图绑到步骤号
+    ops_start = text.find("## " + SECTION_OPS)
+    ops_end = text.find("## " + SECTION_EXT)
+    if ops_start >= 0 and ops_end > ops_start:
+        ops_range = (ops_start, ops_end)
+    else:
+        ops_range = (-1, -1)
+
+    def step_at(pos):
+        """pos 之前最近的 N. 步骤编号（只认「操作」段内的）"""
+        s, e = ops_range
+        if s < 0 or not (s <= pos <= e):
+            return None
+        last = None
+        for m in re.finditer(r"^\s*(\d+)[.、)]", text[s:pos], re.M):
+            last = int(m.group(1))
+        return last
+
+    def to_url(p):
+        p = p.strip()
+        if p.startswith(("http://", "https://", "data:")):
+            return p
+        p = p.lstrip("./")
+        if not p.lower().endswith(IMG_EXTS):
+            return None
+        return (f"https://raw.githubusercontent.com/{IMG_REPO}/{IMG_BRANCH}/"
+                f"{quote(md_dir)}/{quote(p)}")
+
+    def is_cover(alt, base):
+        """成品/封面图判据。
+
+        ⚠ 不能把「预览」算进封面词：上游给整批步骤图起的名字就是
+        「水煮牛肉-预览图-2 … -12」「凉粉-预览图-1 … -11」，全是连续编号的步骤序列。
+        把「预览」当封面词会把这类菜谱的步骤图整批刷掉（实测水煮牛肉 12 张、凉粉 11 张全灭）。
+        """
+        a, n = alt.lower(), base.lower()
+        return (any(k in a for k in ("成品", "封面", "摆盘", "结果"))
+                or any(k in n for k in ("成品", "cover", "result", "final")))
+
+    found = []
+    for m in IMG_RE.finditer(text):
+        alt, raw = m.group(1).strip(), m.group(2)
+        url = to_url(raw)
+        if not url:
+            continue
+        if any(url == f[0] for f in found):
+            continue
+        found.append((url, alt, os.path.basename(raw.strip()), m.start()))
+
+    if not found:
+        return None, [], []
+
+    total = len(found)
+    covers, all_urls, step_images = [], [], []
+    for idx, (url, alt, base, pos) in enumerate(found):
+        all_urls.append(url)
+        stem = os.path.splitext(base)[0]
+        sn = step_at(pos)
+        numbered = bool(re.fullmatch(r"\d+", stem)) or bool(
+            re.search(r"(步骤|step)", alt + stem, re.I))
+        # 步骤图判据：不是成品/预览图 &&（文件名是数字编号 或 本菜谱有多张图）。
+        # ⚠ 不能要求「必须落在操作段内」——戚风蛋糕那 9 张实操图是集中放在
+        # 「## 附加内容」下的「一些参考图片」里的，按段落卡会全军覆没。
+        # sn 为 None 时按 md 出现顺序（= 制作顺序）排列，sort 稳定性保证不乱。
+        if not is_cover(alt, base) and (numbered or total > 1):
+            step_images.append({"step": sn, "order": idx, "alt": alt or stem, "url": url})
+        elif is_cover(alt, base):
+            covers.append(url)
+
+    cover = (covers[0] if covers
+             else (all_urls[0] if total == 1 else None))
+    # 有步骤号的按步骤升序，没有的按出现顺序跟在后面 —— 保证「按菜谱顺序」发图
+    step_images.sort(key=lambda x: (x["step"] is None, x["step"] or 0, x["order"]))
+    return cover, all_urls, step_images
+
+
 def build_recipe(md_path, root, category_dir):
     text = open(md_path, encoding="utf-8").read()
     head, secs = split_sections(text)
@@ -196,14 +291,17 @@ def build_recipe(md_path, root, category_dir):
         notes = [tail] if tail else []
 
     cat = CATEGORY_MAP.get(category_dir, category_dir)
+    cover, imgs, step_imgs = extract_images(md_path, root)
 
     return {
         "id": rid,
         "name": title,
         "description": head,
         "source_path": rel,
-        "image_path": None,
-        "images": [],
+        "image_path": cover,
+        "images": imgs,
+        "step_images": step_imgs,
+        "has_step_images": bool(step_imgs),
         "category": cat,
         "difficulty": parse_difficulty(head),
         "tags": [cat],
@@ -273,7 +371,9 @@ def main():
     print("  分类:", json.dumps(stats["by_cat"], ensure_ascii=False))
     withsteps = sum(1 for r in out if r["steps"])
     withqty = sum(1 for r in out if any(i["quantity"] is not None for i in r["ingredients"]))
+    withstepimg = sum(1 for r in out if r.get("has_step_images"))
     print(f"  有步骤: {withsteps}/{len(out)} | 有解析出份量的: {withqty}/{len(out)}")
+    print(f"  带步骤分解图: {withstepimg}/{len(out)}")
     if stats["failed"]:
         print(f"  ✗ 解析失败 {len(stats['failed'])}:")
         for x in stats["failed"][:8]:
