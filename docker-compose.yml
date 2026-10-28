@@ -5,7 +5,7 @@ services:
     container_name: howtocook-mcp
     ports:
       # 宿主机端口:容器端口（3000 被占用时改左边即可）
-      - "3000:3000"
+      - "3010:3000"
     # 默认 HTTP 模式（/mcp 端点）；改用 SSE 模式请换成:
     # command: ["--transport", "sse", "--port", "3000"]
     restart: unless-stopped
